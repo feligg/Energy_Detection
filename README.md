@@ -23,3 +23,9 @@ energy_anomaly_project/
     ├── results/                 # CSV / JSON / parquet results
     ├── figures/                 # method comparison plots
     └── cases/                   # one PNG per inspected case
+
+
+    pip install -r requirements.txt
+python scripts/download_data.py      # ±195 MB
+python run_pipeline.py               # ±3 menit
+streamlit run app/streamlit_app.py
