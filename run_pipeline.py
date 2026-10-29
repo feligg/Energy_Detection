@@ -73,4 +73,3 @@ def detectors_cols():
 
 if __name__ == "__main__":
     main()
-    re
