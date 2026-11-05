@@ -1,41 +1,77 @@
-"""Task 6 - Streamlit dashboard.
+"""Task 6 - Streamlit dashboard (black and white, kept simple).
 
 Run:  streamlit run app/streamlit_app.py
 (first run `python run_pipeline.py` so that outputs/results exists)
 """
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
-RES, CASES = ROOT / "outputs" / "results", ROOT / "outputs" / "cases"
+sys.path.insert(0, str(ROOT))
+from src import config as C                      # noqa: E402
+from src.savings import attention_levels          # noqa: E402
 
+RES, CASES, FIGS = C.RESULTS, C.CASES, C.FIGURES
 METHODS = ["zscore", "iqr", "iforest", "residual"]
 TYPES = ["night_high", "weekend_high", "sudden_increase", "weather_deviation", "sustained_high"]
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 TYPE_TEXT = {
-    "night_high": "Night 22:00-05:59: robust z > 3 vs the building's own nights and >= 1.25x normal level",
-    "weekend_high": "Weekend daytime hour at >= 95 % of weekday level in a building that normally drops >= 10 % on weekends",
-    "sudden_increase": "1-hour increase > Q3 + 3*IQR of the building's own increases and > 30 % of its median load",
-    "weather_deviation": "Actual >= 1.3x expected for similar weather and residual robust z > 3",
-    "sustained_high": ">= 6 consecutive hours with robust z > 2.5 and >= 1.2x normal level",
+    "night_high": f"Night 22:00-05:59: robust z > {C.ROBUST_Z} vs the building's own nights "
+                  f"and >= {C.MIN_EXCESS_RATIO}x its normal level.",
+    "weekend_high": f"Weekend or academic-break daytime hour at >= {C.WEEKEND_AS_WEEKDAY_RATIO:.0%} of "
+                    f"working-day level, in a building that normally drops >= "
+                    f"{1 - C.WEEKEND_DROP_RATIO:.0%} on such days.",
+    "sudden_increase": f"1-hour increase > Q3 + {C.SUDDEN_IQR_K}*IQR of the building's own increases "
+                       f"and > {C.SUDDEN_MIN_RATIO:.0%} of its median load.",
+    "weather_deviation": f"Actual >= {C.WEATHER_RATIO}x the expected use for similar weather "
+                         f"and residual robust z > {C.ROBUST_Z}.",
+    "sustained_high": f">= {C.SUSTAINED_HOURS} consecutive hours with robust z > {C.SUSTAINED_Z} "
+                      f"and >= {C.SUSTAINED_RATIO}x normal level.",
 }
-COL_TYPE = dict(zip(TYPES, ["#6a4c93", "#1982c4", "#ff9f1c", "#e63946", "#2a9d8f"]))
-COL_METHOD = dict(zip(METHODS, ["#e63946", "#ff9f1c", "#6a4c93", "#2a9d8f"]))
+SYMBOL_METHOD = dict(zip(METHODS, ["circle-open", "square-open", "x", "diamond-open"]))
+SYMBOL_TYPE = dict(zip(TYPES, ["circle-open", "square-open", "triangle-up-open", "x", "diamond-open"]))
+DASH_METHOD = dict(zip(METHODS, ["solid", "dash", "dot", "dashdot"]))
+
+# ----------------------------------------------------------------- styling
+BW = go.layout.Template()
+BW.layout = go.Layout(
+    paper_bgcolor="white", plot_bgcolor="white",
+    font=dict(color="black", family="Helvetica, Arial, sans-serif", size=13),
+    colorway=["#000000", "#666666", "#999999", "#bbbbbb", "#dddddd"],
+    xaxis=dict(showgrid=False, linecolor="black", ticks="outside", zeroline=False),
+    yaxis=dict(gridcolor="#e5e5e5", linecolor="black", ticks="outside", zeroline=False),
+    margin=dict(t=50, b=30, l=50, r=20), hovermode="x unified",
+    legend=dict(orientation="h", y=-0.2))
+GREYS = [[0, "#ffffff"], [1, "#000000"]]
+
+
+def show(fig, height=380, **kw):
+    fig.update_layout(template=BW, height=height, **kw)
+    st.plotly_chart(fig, width="stretch")
+
 
 st.set_page_config(page_title="Abnormal Energy Consumption", layout="wide")
+st.markdown("""<style>
+h1, h2, h3 {font-weight: 600; letter-spacing: -0.01em;}
+[data-testid="stMetricValue"] {font-weight: 600;}
+.block-container {padding-top: 2rem; max-width: 1200px;}
+</style>""", unsafe_allow_html=True)
 
 
 @st.cache_data(show_spinner="Loading results ...")
 def load():
-    ts = pd.read_parquet(RES / "timeseries_flags.parquet")
-    ts["saving_kwh"] = np.where(ts["final_anomaly"] == 1,
-                                (ts["kwh"] - ts["expected_kwh"]).clip(lower=0), 0.0)
-    return ts
+    return pd.read_parquet(RES / "timeseries_flags.parquet")
+
+
+def read_csv(name):
+    f = RES / name
+    return pd.read_csv(f) if f.exists() else None
 
 
 if not (RES / "timeseries_flags.parquet").exists():
@@ -46,193 +82,224 @@ ts = load()
 valid = ts[ts["kwh"].notna()]
 
 # ------------------------------------------------------------------ sidebar
-st.sidebar.title("Filters")
+st.sidebar.header("Filters")
 sites = sorted(valid["site_id"].unique())
 site_sel = st.sidebar.multiselect("Site", sites, default=sites)
 scope = valid[valid["site_id"].isin(site_sel)]
+if scope.empty:
+    st.warning("Select at least one site.")
+    st.stop()
 d0, d1 = scope["timestamp"].min().date(), scope["timestamp"].max().date()
 date_rng = st.sidebar.date_input("Date range", (d0, d1), min_value=d0, max_value=d1)
-if len(date_rng) == 2:
-    scope = scope[(scope["timestamp"].dt.date >= date_rng[0]) & (scope["timestamp"].dt.date <= date_rng[1])]
-meth_sel = st.sidebar.multiselect("Detection methods shown", METHODS, default=METHODS)
-type_sel = st.sidebar.multiselect("Anomaly types shown", TYPES, default=TYPES)
-st.sidebar.caption("Final anomaly = flagged by >= 2 of the 4 methods.")
+if isinstance(date_rng, (tuple, list)) and len(date_rng) == 2:
+    scope = scope[(scope["timestamp"].dt.date >= date_rng[0])
+                  & (scope["timestamp"].dt.date <= date_rng[1])]
+st.sidebar.caption("Final anomaly = flagged by at least 2 of 3 method families "
+                   "(statistical, Isolation Forest, residual).")
 
 # ----------------------------------------------------------- building table
 bld = (scope.groupby("building_id")
        .agg(site=("site_id", "first"), use=("sub_primaryspaceusage", "first"),
-            actual_kwh=("kwh", "sum"), saving_kwh=("saving_kwh", "sum"),
+            actual_kwh=("kwh", "sum"), saving_low=("saving_low_kwh", "sum"),
+            saving_kwh=("saving_kwh", "sum"), saving_high=("saving_high_kwh", "sum"),
             anomaly_hours=("final_anomaly", "sum"), hours=("kwh", "size"))
        .reset_index())
 bld["avoidable_pct"] = (bld["saving_kwh"] / bld["actual_kwh"] * 100).round(2)
-bld["share_anomalous_hours_pct"] = (bld["anomaly_hours"] / bld["hours"] * 100).round(2)
+bld["anomalous_hours_pct"] = (bld["anomaly_hours"] / bld["hours"] * 100).round(2)
 fin = scope[scope["final_anomaly"] == 1]
 dom = fin.groupby("building_id")[TYPES].sum().idxmax(axis=1) if len(fin) else pd.Series(dtype=str)
-bld["main_anomaly_type"] = bld["building_id"].map(dom).fillna("none")
-bld["attention"] = pd.cut(bld["avoidable_pct"], [-1, 1, 3, 1e9], labels=["low", "medium", "high"]).astype(str)
+bld["main_type"] = bld["building_id"].map(dom).fillna("none")
+bld["attention"] = attention_levels(bld["avoidable_pct"])
 bld = bld.sort_values("saving_kwh", ascending=False).reset_index(drop=True)
 
-st.title("Abnormal electricity consumption and energy-saving potential")
-st.caption("BDG2 education buildings. Savings are model-based ESTIMATES, "
+st.title("Abnormal electricity consumption")
+st.caption("BDG2 education buildings. All savings are model-based ESTIMATES, "
            "not verified savings from a real control system.")
 
-tabs = st.tabs(["Overview", "Building time series", "Anomaly types", "Method comparison",
-                "Saving potential", "Buildings needing attention", "Inspected cases", "Data quality"])
+tabs = st.tabs(["Overview", "Building", "Methods", "Savings", "Attention list", "Cases"])
 
 # --------------------------------------------------------------- 1 overview
 with tabs[0]:
-    c = st.columns(5)
+    tot = scope["kwh"].sum()
+    c = st.columns(4)
     c[0].metric("Buildings", f"{scope['building_id'].nunique():,}")
-    c[1].metric("Hours analysed", f"{len(scope):,}")
-    c[2].metric("Final anomaly hours", f"{int(scope['final_anomaly'].sum()):,}",
-                f"{scope['final_anomaly'].mean() * 100:.2f} % of hours")
-    c[3].metric("Potential saving (kWh)", f"{scope['saving_kwh'].sum():,.0f}")
-    c[4].metric("Avoidable share", f"{scope['saving_kwh'].sum() / max(scope['kwh'].sum(), 1) * 100:.2f} %")
+    c[1].metric("Anomaly hours", f"{int(scope['final_anomaly'].sum()):,}")
+    c[1].caption(f"{scope['final_anomaly'].mean() * 100:.2f} % of all hours")
+    c[2].metric("Potential saving", f"{scope['saving_kwh'].sum() / 1000:,.0f} MWh")
+    c[2].caption(f"range {scope['saving_low_kwh'].sum() / 1000:,.0f} - "
+                 f"{scope['saving_high_kwh'].sum() / 1000:,.0f} MWh (low - high)")
+    c[3].metric("Avoidable share", f"{scope['saving_kwh'].sum() / max(tot, 1) * 100:.2f} %")
     a, b = st.columns(2)
-    site_sv = scope.groupby("site_id")[["saving_kwh", "kwh"]].sum().reset_index()
-    site_sv["avoidable_pct"] = site_sv["saving_kwh"] / site_sv["kwh"] * 100
-    a.plotly_chart(px.bar(site_sv.sort_values("saving_kwh", ascending=False), x="site_id",
-                          y="saving_kwh", color="avoidable_pct", color_continuous_scale="Reds",
-                          title="Estimated saving potential by site (kWh)"), width="stretch")
     if len(fin):
         heat = (fin.pivot_table(index="dow", columns="hour", values="kwh", aggfunc="size", fill_value=0)
                 .reindex(index=range(7), columns=range(24), fill_value=0))
-        heat.index = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        b.plotly_chart(px.imshow(heat, aspect="auto", color_continuous_scale="Reds",
-                                 labels=dict(x="hour of day", y="weekday", color="anomaly hours"),
-                                 title="When do final anomalies occur?"), width="stretch")
-    fig_png = ROOT / "outputs" / "figures" / "method_comparison.png"
-    if fig_png.exists():
-        st.image(str(fig_png))
+        fig = go.Figure(go.Heatmap(z=heat.values, x=list(range(24)), y=DAYS, colorscale=GREYS,
+                                   colorbar=dict(title="hours")))
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(title="When do anomalies occur?", xaxis_title="hour of day")
+        with a:
+            show(fig)
+    tcount = pd.DataFrame({"type": TYPES, "hours": [int(scope[t].sum()) for t in TYPES]})
+    fig = go.Figure(go.Bar(x=tcount["hours"], y=tcount["type"], orientation="h", marker_color="black"))
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(title="Anomaly hours per rule type")
+    with b:
+        show(fig)
+    with st.expander("How each anomaly type is defined"):
+        st.table(pd.DataFrame({"type": TYPES, "rule": [TYPE_TEXT[t] for t in TYPES]}).set_index("type"))
+    with st.expander("Data preparation and quality"):
+        q = RES / "data_quality_report.md"
+        st.markdown(q.read_text() if q.exists() else "No report found.")
 
-# ------------------------------------------------------ 2 building time series
+# ------------------------------------------------------------- 2 building
 with tabs[1]:
     order = bld["building_id"].tolist()
-    if not order:
-        st.warning("No data for this filter.")
+    bsel = st.selectbox("Building (sorted by saving potential)", order)
+    mode = st.radio("Show anomalies by", ["Final decision", "Detection method", "Anomaly type"],
+                    horizontal=True)
+    g = scope[scope["building_id"] == bsel].sort_values("timestamp")
+    fig = go.Figure()
+    fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["kwh"], mode="lines", name="actual",
+                               line=dict(color="black", width=1)))
+    fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["expected_kwh"], mode="lines",
+                               name="expected normal", line=dict(color="#888888", width=1, dash="dot")))
+    if mode == "Final decision":
+        a_ = g[g["final_anomaly"] == 1]
+        fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name="final anomaly",
+                                   marker=dict(color="black", size=5)))
+    elif mode == "Detection method":
+        for m in METHODS:
+            a_ = g[g[f"m_{m}"] == 1]
+            fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name=m,
+                                       marker=dict(color="black", size=7, symbol=SYMBOL_METHOD[m])))
     else:
-        bsel = st.selectbox("Building (sorted by saving potential)", order)
-        mode = st.radio("Colour anomalies by", ["Final (>= 2 methods)", "Detection method", "Anomaly type"],
-                        horizontal=True)
-        g = scope[scope["building_id"] == bsel].sort_values("timestamp")
-        fig = go.Figure()
-        fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["kwh"], mode="lines", name="actual (normal)",
-                                   line=dict(color="#1d3557", width=1)))
-        fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["expected_kwh"], mode="lines",
-                                   name="expected normal", line=dict(color="#8ecae6", width=1, dash="dot")))
-        if mode.startswith("Final"):
-            a = g[g["final_anomaly"] == 1]
-            fig.add_trace(go.Scattergl(x=a["timestamp"], y=a["kwh"], mode="markers", name="final anomaly",
-                                       marker=dict(color="#e63946", size=5)))
-        elif mode.startswith("Detection"):
-            for m in meth_sel:
-                a = g[g[f"m_{m}"] == 1]
-                fig.add_trace(go.Scattergl(x=a["timestamp"], y=a["kwh"], mode="markers", name=m,
-                                           marker=dict(color=COL_METHOD[m], size=5)))
-        else:
-            for t in type_sel:
-                a = g[g[t] == 1]
-                fig.add_trace(go.Scattergl(x=a["timestamp"], y=a["kwh"], mode="markers", name=t,
-                                           marker=dict(color=COL_TYPE[t], size=5)))
-        fig.update_layout(height=480, yaxis_title="kWh per hour", hovermode="x unified",
-                          title=f"{bsel}: normal vs abnormal periods", margin=dict(t=50, b=10))
-        st.plotly_chart(fig, width="stretch")
-        daily = g.assign(date=g["timestamp"].dt.date).groupby("date")["saving_kwh"].sum().reset_index()
-        st.plotly_chart(px.bar(daily, x="date", y="saving_kwh",
-                               title="Estimated avoidable consumption per day (kWh)"), width="stretch")
+        for t in TYPES:
+            a_ = g[g[t] == 1]
+            fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name=t,
+                                       marker=dict(color="black", size=7, symbol=SYMBOL_TYPE[t])))
+    fig.update_layout(yaxis_title="kWh per hour", title=f"{bsel}: normal and abnormal periods")
+    show(fig, 460)
+    daily = g.assign(date=g["timestamp"].dt.date).groupby("date")["saving_kwh"].sum().reset_index()
+    fig = go.Figure(go.Bar(x=daily["date"], y=daily["saving_kwh"], marker_color="black"))
+    fig.update_layout(title="Estimated avoidable consumption per day (kWh)")
+    show(fig, 260)
 
-# ---------------------------------------------------------- 3 anomaly types
+# -------------------------------------------------------------- 3 methods
 with tabs[2]:
-    rows = [{"type": t, "hours": int(scope[t].sum()),
-             "buildings": int(scope.loc[scope[t] == 1, "building_id"].nunique()),
-             "rule": TYPE_TEXT[t]} for t in TYPES]
-    tt = pd.DataFrame(rows)
-    st.dataframe(tt, width="stretch", hide_index=True)
+    names = METHODS + ["final"]
+    cnt = [int(scope[f"m_{m}"].sum()) for m in METHODS] + [int(scope["final_anomaly"].sum())]
     a, b = st.columns(2)
-    a.plotly_chart(px.bar(tt[tt["type"].isin(type_sel)], x="type", y="hours", color="type",
-                          color_discrete_map=COL_TYPE, title="Anomaly hours per type"), width="stretch")
-    hh = pd.concat([scope[scope[t] == 1].groupby("hour").size().rename(t) for t in type_sel], axis=1) \
-        .reindex(range(24)).fillna(0) if type_sel else pd.DataFrame()
-    if len(hh):
-        b.plotly_chart(px.line(hh, title="Hour of day of each anomaly type",
-                               color_discrete_map=COL_TYPE), width="stretch")
-
-# -------------------------------------------------------- 4 method comparison
-with tabs[3]:
-    cnt = pd.DataFrame({"method": METHODS + ["final"],
-                        "hours": [int(scope[f"m_{m}"].sum()) for m in METHODS] + [int(scope["final_anomaly"].sum())]})
-    a, b, c3 = st.columns(3)
-    a.plotly_chart(px.bar(cnt, x="method", y="hours", title="Hours flagged"), width="stretch")
+    fig = go.Figure(go.Bar(x=names, y=cnt, marker_color=["black"] * 4 + ["#888888"]))
+    fig.update_layout(title="Hours flagged", hovermode="closest")
+    with a:
+        show(fig, 330)
     jac = pd.DataFrame(index=METHODS, columns=METHODS, dtype=float)
     for m1 in METHODS:
         for m2 in METHODS:
             A, B = scope[f"m_{m1}"] == 1, scope[f"m_{m2}"] == 1
             jac.loc[m1, m2] = (A & B).sum() / max((A | B).sum(), 1)
-    b.plotly_chart(px.imshow(jac.round(2), text_auto=True, color_continuous_scale="Blues",
-                             zmin=0, zmax=1, title="Agreement (Jaccard)"), width="stretch")
-    ag = scope[scope["n_methods"] > 0].groupby("n_methods").size().rename("hours").reset_index()
-    c3.plotly_chart(px.bar(ag, x="n_methods", y="hours", title="Hours by number of agreeing methods"),
-                    width="stretch")
-    per_b = scope.groupby("building_id")[[f"m_{m}" for m in METHODS]].sum()
-    per_b.columns = METHODS
-    st.subheader("Flagged hours per building and method")
-    st.dataframe(per_b.sort_values("iqr", ascending=False), width="stretch")
+    fig = go.Figure(go.Heatmap(z=jac.values.round(2), x=METHODS, y=METHODS, colorscale=GREYS,
+                               zmin=0, zmax=1, text=jac.values.round(2), texttemplate="%{text}"))
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(title="Agreement between methods (Jaccard)", hovermode="closest")
+    with b:
+        show(fig, 330)
+    hh = pd.concat([scope[scope[f"m_{m}"] == 1].groupby("hour").size().rename(m) for m in METHODS],
+                   axis=1).reindex(range(24)).fillna(0)
+    fig = go.Figure()
+    for m in METHODS:
+        fig.add_trace(go.Scatter(x=hh.index, y=hh[m] / max(hh[m].sum(), 1), mode="lines", name=m,
+                                 line=dict(color="black", width=1.5, dash=DASH_METHOD[m])))
+    fig.update_layout(title="When in the day does each method flag? (share of its flags)",
+                      xaxis_title="hour of day")
+    show(fig, 320)
+    per_b = scope.groupby("building_id")[[f"m_{m}" for m in METHODS] + ["final_anomaly"]].sum()
+    per_b.columns = METHODS + ["final"]
+    st.subheader("Flagged hours per building")
+    st.dataframe(per_b.sort_values("final", ascending=False), width="stretch", height=300)
+    rc = read_csv("eval_rule_confirmation.csv")
+    if rc is not None:
+        st.subheader("Are the rule types backed by the detection methods?")
+        st.dataframe(rc, width="stretch", hide_index=True)
 
-# --------------------------------------------------------- 5 saving potential
-with tabs[4]:
-    st.info("Potential saving = actual consumption - expected normal consumption, summed over final "
-            "anomaly hours. This is an estimate, not a verified saving.")
+# --------------------------------------------------------------- 4 savings
+with tabs[3]:
+    st.caption("Potential saving = actual consumption - expected normal consumption, summed over final "
+            "anomaly hours. Low: all 3 families agree. Central: at least 2 agree. "
+            "High: at least 2 of the 4 methods agree.")
     sc = scope.assign(month=scope["timestamp"].dt.to_period("M").dt.to_timestamp(),
                       date=scope["timestamp"].dt.date)
-    nb = max(sc["building_id"].nunique(), 1)
-    ndays = max(sc["date"].nunique(), 1)
+    nb, ndays = max(sc["building_id"].nunique(), 1), max(sc["date"].nunique(), 1)
+    s_c = sc["saving_kwh"].sum()
     c = st.columns(4)
-    c[0].metric("Total potential saving", f"{sc['saving_kwh'].sum():,.0f} kWh")
-    c[1].metric("Avg daily / building", f"{sc['saving_kwh'].sum() / ndays / nb:,.1f} kWh")
-    c[2].metric("Avg monthly / building", f"{sc['saving_kwh'].sum() / ndays / nb * 30.4:,.0f} kWh")
-    c[3].metric("Avoidable share", f"{sc['saving_kwh'].sum() / max(sc['kwh'].sum(), 1) * 100:.2f} %")
-    mon = sc.groupby("month")[["saving_kwh", "kwh"]].sum().reset_index()
-    mon["avoidable_pct"] = mon["saving_kwh"] / mon["kwh"] * 100
-    a, b = st.columns(2)
-    a.plotly_chart(px.bar(mon, x="month", y="saving_kwh", title="Monthly potential saving (kWh)"),
-                   width="stretch")
-    b.plotly_chart(px.line(mon, x="month", y="avoidable_pct", markers=True,
-                           title="Avoidable share of consumption (%)"), width="stretch")
-    st.plotly_chart(px.bar(bld.head(15).iloc[::-1], x="saving_kwh", y="building_id", orientation="h",
-                           color="avoidable_pct", color_continuous_scale="Reds",
-                           title="15 buildings with the greatest saving potential"), width="stretch")
-    dly = sc.groupby("date")["saving_kwh"].sum().reset_index()
-    st.plotly_chart(px.line(dly, x="date", y="saving_kwh", title="Potential saving per day, all buildings (kWh)"),
-                    width="stretch")
+    c[0].metric("Total (central)", f"{s_c / 1000:,.0f} MWh")
+    c[1].metric("Per building per day", f"{s_c / ndays / nb:,.1f} kWh")
+    c[2].metric("Per building per month", f"{s_c / ndays / nb * 30.4:,.0f} kWh")
+    c[3].metric("Avoidable share", f"{s_c / max(sc['kwh'].sum(), 1) * 100:.2f} %")
+    mon = sc.groupby("month")[["saving_low_kwh", "saving_kwh", "saving_high_kwh", "kwh"]].sum().reset_index()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=mon["month"], y=mon["saving_kwh"], name="central", marker_color="black"))
+    fig.add_trace(go.Scatter(x=mon["month"], y=mon["saving_low_kwh"], name="low", mode="lines+markers",
+                             line=dict(color="#888888", dash="dot")))
+    fig.add_trace(go.Scatter(x=mon["month"], y=mon["saving_high_kwh"], name="high", mode="lines+markers",
+                             line=dict(color="#888888", dash="dash")))
+    fig.update_layout(title="Monthly potential saving (kWh)")
+    show(fig, 340)
+    top = bld.head(15).iloc[::-1]
+    fig = go.Figure(go.Bar(
+        x=top["saving_kwh"], y=top["building_id"], orientation="h", marker_color="black",
+        error_x=dict(type="data", symmetric=False, color="#888888",
+                     array=(top["saving_high"] - top["saving_kwh"]).clip(lower=0),
+                     arrayminus=(top["saving_kwh"] - top["saving_low"]).clip(lower=0))))
+    fig.update_layout(title="15 buildings with the greatest saving potential (bar = central, whisker = low-high)",
+                      hovermode="closest")
+    show(fig, 480)
+    site_sv = (scope.groupby("site_id")[["saving_kwh", "kwh"]].sum().reset_index()
+               .assign(avoidable_pct=lambda x: x.saving_kwh / x.kwh * 100)
+               .sort_values("saving_kwh", ascending=False))
+    fig = go.Figure(go.Bar(x=site_sv["site_id"], y=site_sv["saving_kwh"], marker_color="black"))
+    fig.update_layout(title="Potential saving by site (kWh)", hovermode="closest")
+    show(fig, 300)
 
-# ------------------------------------------------------------ 6 attention list
-with tabs[5]:
+# ----------------------------------------------------------- 5 attention
+with tabs[4]:
     lvl = st.multiselect("Attention level", ["high", "medium", "low"], default=["high", "medium"])
-    show = bld[bld["attention"].isin(lvl)][
-        ["building_id", "site", "use", "attention", "saving_kwh", "avoidable_pct", "anomaly_hours",
-         "share_anomalous_hours_pct", "main_anomaly_type"]].round(1)
-    st.caption("Level from the avoidable share: low < 1 %, medium 1-3 %, high > 3 %. "
-               "The list is sorted by absolute saving potential (kWh).")
-    st.dataframe(show, width="stretch", hide_index=True)
-    st.download_button("Download list (CSV)", show.to_csv(index=False), "buildings_requiring_attention.csv")
+    show_tbl = bld[bld["attention"].isin(lvl)][
+        ["building_id", "site", "use", "attention", "saving_kwh", "saving_low", "saving_high",
+         "avoidable_pct", "anomaly_hours", "anomalous_hours_pct", "main_type"]].round(1)
+    st.caption("Level is relative to the other buildings shown: high = top 10 % by avoidable share, "
+               "medium = next 20 %, low = the rest. Sorted by absolute saving potential (kWh).")
+    st.dataframe(show_tbl, width="stretch", hide_index=True)
+    st.download_button("Download list (CSV)", show_tbl.to_csv(index=False),
+                       "buildings_requiring_attention.csv")
 
-# ----------------------------------------------------------- 7 inspected cases
-with tabs[6]:
+# ---------------------------------------------------------------- 6 cases
+with tabs[5]:
     f = RES / "representative_cases.csv"
     if f.exists():
-        cs = pd.read_csv(f)
-        st.dataframe(cs[["case_id", "building_id", "start", "duration_h", "total_excess_kwh", "primary_type",
-                         "methods", "mean_temp_c", "possible_reason"]].round(1), width="stretch", hide_index=True)
-        cid = st.selectbox("Show case plot", cs["case_id"].tolist())
+        cs = pd.read_csv(f).fillna("")
+        cols = [c_ for c_ in ["case_id", "case_group", "building_id", "start", "duration_h",
+                              "total_excess_kwh", "primary_type", "methods", "verdict",
+                              "reviewer_notes"] if c_ in cs.columns]
+        st.dataframe(cs[cols], width="stretch", hide_index=True)
+        cid = st.selectbox("Case plot", cs["case_id"].tolist())
         img = list(CASES.glob(f"{cid}_*.png"))
         if img:
             st.image(str(img[0]))
         st.caption(cs.loc[cs["case_id"] == cid, "possible_reason"].iloc[0])
-
-# ------------------------------------------------------------- 8 data quality
-with tabs[7]:
-    q = RES / "data_quality_report.md"
-    st.markdown(q.read_text() if q.exists() else "No report found.")
-    s = RES / "data_quality_summary.json"
-    if s.exists():
-        st.json(json.loads(s.read_text()), expanded=False)
+    inj = read_csv("validation_injection.csv")
+    if inj is not None:
+        st.subheader("Validation with injected anomalies")
+        st.caption("Known anomalies were added to real buildings; the table shows the share of "
+                   "injected events each detector finds (event recall).")
+        lv = st.selectbox("Injected size (share of normal level)", sorted(inj["level"].unique()), index=1)
+        piv = (inj[inj["level"] == lv]
+               .pivot(index="inj_type", columns="detector", values="event_recall"))
+        st.dataframe(piv.round(2), width="stretch")
+        fp = (inj[inj["level"] == lv].drop_duplicates("detector")
+              .set_index("detector")["flag_rate_on_untouched_hours"].round(4))
+        st.caption("Share of untouched hours flagged: " + ", ".join(f"{k} {v:.2%}" for k, v in fp.items()))
+    sens = read_csv("validation_sensitivity.csv")
+    if sens is not None:
+        st.subheader("Threshold sensitivity")
+        st.dataframe(sens, width="stretch", hide_index=True)

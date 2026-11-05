@@ -1,10 +1,10 @@
-"""Expected ("normal") consumption under similar weather conditions.
+"""Calendar features and the expected ("normal") consumption.
 
-If Student 1's predictions are available they are used. Otherwise a
-weather-aware baseline is trained per building with blocked cross-fitting:
-the time axis is cut into CV_BLOCKS contiguous blocks and every block is
-predicted by a model that never saw it, so the model cannot simply memorise
-(and therefore hide) the anomalies it is supposed to expose.
+Expected consumption under similar weather = Student 1's predictions when the
+file exists, otherwise a weather-aware gradient-boosting baseline trained per
+building with blocked cross-fitting: the time axis is cut into CV_BLOCKS
+contiguous blocks and every block is predicted by a model that never saw it, so
+the model cannot memorise (and therefore hide) the anomalies we want to expose.
 """
 import numpy as np
 import pandas as pd
@@ -13,8 +13,28 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 
 from . import config as C
 
-FEATURES = ["hour", "dow", "month", "doy", "is_weekend", "airTemperature",
+FEATURES = ["hour", "dow", "month", "doy", "is_weekend", "is_break", "airTemperature",
             "dewTemperature", "windSpeed", "cloudCoverage", "temp_24h_mean"]
+
+
+def add_off_days(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag weekdays on which a whole site runs far below its normal load
+    (academic breaks, public holidays). Uses the median over the site's
+    buildings, so a single abnormal building cannot create a "break"."""
+    date = df["timestamp"].dt.normalize()
+    daily = (df.assign(date=date).groupby(["site_id", "building_id", "date"])["kwh"]
+             .mean().rename("daily").reset_index())
+    daily = daily[daily["date"].dt.dayofweek < 5].dropna(subset=["daily"])
+    ref = daily.groupby("building_id")["daily"].transform("median")
+    daily["rel"] = daily["daily"] / ref.clip(lower=1e-6)
+    site = daily.groupby(["site_id", "date"]).agg(site_rel=("rel", "median"),
+                                                  n=("rel", "size")).reset_index()
+    site["is_break"] = ((site["site_rel"] < C.BREAK_RATIO)
+                        & (site["n"] >= C.BREAK_MIN_BUILDINGS)).astype("int8")
+    key = pd.DataFrame({"site_id": df["site_id"].to_numpy(), "date": date.to_numpy()})
+    key = key.merge(site[["site_id", "date", "is_break"]], on=["site_id", "date"], how="left")
+    df["is_break"] = key["is_break"].fillna(0).astype("int8").to_numpy()
+    return df
 
 
 def add_calendar(df: pd.DataFrame) -> pd.DataFrame:
@@ -24,6 +44,9 @@ def add_calendar(df: pd.DataFrame) -> pd.DataFrame:
     df["month"] = ts.dt.month.astype("int8")
     df["doy"] = ts.dt.dayofyear.astype("int16")
     df["is_weekend"] = (df["dow"] >= 5).astype("int8")
+    df["season"] = df["month"].map(C.SEASON_OF_MONTH).astype("int8")
+    df = add_off_days(df)
+    df["is_off"] = ((df["is_weekend"] == 1) | (df["is_break"] == 1)).astype("int8")
     df["temp_24h_mean"] = (df.groupby("building_id")["airTemperature"]
                            .transform(lambda s: s.rolling(24, min_periods=6).mean())
                            .astype("float32"))

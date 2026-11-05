@@ -1,8 +1,12 @@
 """Task 2 - rule-based definitions of five abnormal-consumption types.
 
 All rules compare a building with ITS OWN normal behaviour, so a large and a
-small building are treated fairly. "Context" = same building + same
-hour-of-day + same day-type (weekday / weekend).
+small building are treated fairly.
+
+  Context  = same building + same season + same day-type (working day vs
+             weekend/academic-break day) + same hour of day.
+  Context2 = same building + same season + same weekday + same hour of day
+             (used by the IQR method, so it is not a copy of the z-score context).
 
 Robust z-score = (x - median) / (1.4826 * MAD): like a z-score, but median and
 MAD are not distorted by the very anomalies we are looking for.
@@ -12,23 +16,38 @@ import pandas as pd
 
 from . import config as C
 
-CTX = ["building_id", "is_weekend", "hour"]
+CTX = ["building_id", "season", "is_off", "hour"]
+CTX2 = ["building_id", "season", "dow", "hour"]
 TYPE_COLS = ["night_high", "weekend_high", "sudden_increase",
              "weather_deviation", "sustained_high"]
 
 
+def _ctx_table(df, keys):
+    g = df.groupby(keys, observed=True)["kwh"]
+    t = g.agg(median="median", mean="mean", std="std", n="count")
+    t["q1"] = g.quantile(0.25)
+    t["q3"] = g.quantile(0.75)
+    return t.reset_index()
+
+
+def _join(df, keys, table, cols, prefix):
+    m = df[keys].merge(table[keys + cols], on=keys, how="left")
+    for c in cols:
+        df[f"{prefix}{c}"] = m[c].to_numpy().astype("float32")
+
+
 def add_context_stats(df: pd.DataFrame) -> pd.DataFrame:
     """Median / MAD / robust-z / mean / std / quartiles inside each context."""
-    g = df.groupby(CTX)["kwh"]
-    df["ctx_median"] = g.transform("median").astype("float32")
-    df["ctx_mean"] = g.transform("mean").astype("float32")
-    df["ctx_std"] = g.transform("std").astype("float32")
-    df["ctx_q1"] = g.transform(lambda s: s.quantile(0.25)).astype("float32")
-    df["ctx_q3"] = g.transform(lambda s: s.quantile(0.75)).astype("float32")
+    t1 = _ctx_table(df, CTX)
+    _join(df, CTX, t1, ["median", "mean", "std", "q1", "q3", "n"], "ctx_")
+    t2 = _ctx_table(df, CTX2)
+    _join(df, CTX2, t2, ["q1", "q3", "n"], "ctx2_")
+
     absdev = (df["kwh"] - df["ctx_median"]).abs()
-    mad = absdev.groupby([df[c] for c in CTX]).transform("median")
+    mad = absdev.groupby([df[c] for c in CTX], observed=True).transform("median")
     scale = np.maximum(1.4826 * mad, 0.02 * df["ctx_median"].abs() + 1e-6)
-    df["robust_z"] = ((df["kwh"] - df["ctx_median"]) / scale).astype("float32")
+    rz = (df["kwh"] - df["ctx_median"]) / scale
+    df["robust_z"] = rz.where(df["ctx_n"] >= C.MIN_CONTEXT_SAMPLES).astype("float32")
     return df
 
 
@@ -39,15 +58,18 @@ def rule_night_high(df):
 
 
 def rule_weekend_high(df):
-    """2. A weekend (daytime) hour where a building that normally steps down on
-    weekends runs at weekday level or above."""
-    wk = (df[df["is_weekend"] == 0].groupby(["building_id", "hour"])["kwh"]
-          .median().rename("weekday_median").reset_index())
-    d = df[["building_id", "hour"]].merge(wk, on=["building_id", "hour"], how="left")
-    weekday_med = d["weekday_median"].to_numpy()
-    return ((df["is_weekend"] == 1) & ~df["hour"].isin(C.NIGHT_HOURS)
-            & (df["ctx_median"] < C.WEEKEND_DROP_RATIO * weekday_med)
-            & (df["kwh"] >= C.WEEKEND_AS_WEEKDAY_RATIO * weekday_med)
+    """2. A weekend / academic-break daytime hour where a building that normally
+    steps down on such days runs at working-day level or above."""
+    work = df[df["is_off"] == 0]
+    wk = (work.groupby(["building_id", "season", "hour"])["kwh"].median()
+          .rename("workday_median").reset_index())
+    d = df[["building_id", "season", "hour"]].merge(
+        wk, on=["building_id", "season", "hour"], how="left")
+    ref = d["workday_median"].to_numpy()
+    return ((df["is_off"] == 1) & ~df["hour"].isin(C.NIGHT_HOURS)
+            & (df["ctx_n"] >= C.MIN_CONTEXT_SAMPLES)
+            & (df["ctx_median"] < C.WEEKEND_DROP_RATIO * ref)
+            & (df["kwh"] >= C.WEEKEND_AS_WEEKDAY_RATIO * ref)
             & (df["kwh"] > C.MIN_EXCESS_RATIO * df["ctx_median"]))
 
 
@@ -86,14 +108,16 @@ def rule_sustained_high(df):
     return high & (run_len >= C.SUSTAINED_HOURS)
 
 
+RULES = {"night_high": rule_night_high, "weekend_high": rule_weekend_high,
+         "sudden_increase": rule_sudden_increase,
+         "weather_deviation": rule_weather_deviation,
+         "sustained_high": rule_sustained_high}
+
+
 def apply_rules(df: pd.DataFrame) -> pd.DataFrame:
     df = add_context_stats(df)
     valid = df["kwh"].notna()
-    rules = {"night_high": rule_night_high, "weekend_high": rule_weekend_high,
-             "sudden_increase": rule_sudden_increase,
-             "weather_deviation": rule_weather_deviation,
-             "sustained_high": rule_sustained_high}
-    for name, fn in rules.items():
+    for name, fn in RULES.items():
         df[name] = (fn(df).fillna(False) & valid).astype("int8")
     df["n_rule_types"] = df[TYPE_COLS].sum(axis=1).astype("int8")
     return df
