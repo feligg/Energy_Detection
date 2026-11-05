@@ -1,216 +1,95 @@
-"""Task 4 - compare the detection methods and prepare >= 20 cases to inspect.
+"""Task 3 - anomaly-detection methods.
 
-There are no confirmed anomaly labels in BDG2, so precision / recall cannot be
-computed on the real data (see validation.py for the synthetic-injection test
-that does measure recall). Here we measure: how many hours each method flags,
-WHEN it flags them, how much the methods agree (Jaccard), and we examine
-concrete events one by one (plots + a possible reason + a verdict column that
-the student fills in).
+All methods are ONE-SIDED (they only flag consumption that is too HIGH),
+because the goal of the project is to find avoidable energy use.
+
+  1. zscore   - classic (x - mean) / std inside building+season+day-type+hour
+  2. iqr      - Tukey fence  x > Q3 + 1.5*IQR inside building+season+weekday+hour
+  3. iforest  - Isolation Forest per building on calendar, weather and load features
+  4. residual - actual much higher than expected: fence on the building's own
+                residuals (actual - expected), expected = baseline or Student 1
+
+Voting. Z-score and IQR both describe "unusual for this time slot", so they are
+counted as ONE family ("statistical"). The final decision is a vote of the three
+independent families: statistical, iforest, residual.
+
+  final_anomaly : >= 2 families agree   (central estimate)
+  final_low     : all 3 families agree  (conservative estimate)
+  final_high    : >= 2 of the 4 methods (generous estimate)
 """
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import IsolationForest
 
 from . import config as C
-from .anomaly_rules import TYPE_COLS
-from .detectors import METHODS
 
-MCOLS = [f"m_{m}" for m in METHODS]
-GREYS = ["#000000", "#555555", "#999999", "#cccccc"]
+METHODS = ["zscore", "iqr", "iforest", "residual"]
+FAMILIES = ["statistical", "iforest", "residual"]
 
 
-# ------------------------------------------------------------ comparison
-def compare_methods(df: pd.DataFrame) -> dict:
-    v = df[df["kwh"].notna()]
-    n_valid = len(v)
-    out = {}
-
-    rows = []
-    for m in MCOLS + ["f_statistical", "final_low", "final_anomaly", "final_high"] + TYPE_COLS:
-        flagged = v[m].sum()
-        rows.append({"detector": m.replace("m_", ""), "flagged_hours": int(flagged),
-                     "pct_of_valid_hours": round(flagged / n_valid * 100, 3),
-                     "buildings_with_flags": int(v.loc[v[m] == 1, "building_id"].nunique())})
-    out["counts"] = pd.DataFrame(rows)
-
-    # time distribution (share of each method's flags per hour / weekday / month)
-    for key, col in [("hour", "hour"), ("weekday", "dow"), ("month", "month")]:
-        t = v.groupby(col)[MCOLS + ["final_anomaly"]].sum()
-        out[f"time_{key}"] = (t / t.sum()).round(4)
-
-    # consistency between methods: Jaccard overlap
-    jac = pd.DataFrame(index=METHODS, columns=METHODS, dtype=float)
-    for a in METHODS:
-        for b in METHODS:
-            A, B = v[f"m_{a}"] == 1, v[f"m_{b}"] == 1
-            union = (A | B).sum()
-            jac.loc[a, b] = round((A & B).sum() / union, 3) if union else np.nan
-    out["jaccard"] = jac
-
-    out["agreement"] = (v[v["n_families"] > 0].groupby("n_families").size()
-                        .rename("hours").to_frame())
-    out["agreement"]["share"] = (out["agreement"]["hours"] / out["agreement"]["hours"].sum()).round(3)
-
-    # how well is each rule type backed by the detection methods?
-    r = []
-    for t in TYPE_COLS:
-        hit = v[v[t] == 1]
-        r.append({
-            "rule_type": t, "hours": len(hit),
-            "confirmed_by_>=2_families_pct":
-                round((hit["n_families"] >= 2).mean() * 100, 1) if len(hit) else np.nan,
-            # residual is built on the same expected value as weather_deviation,
-            # so also show confirmation WITHOUT it
-            "confirmed_by_statistical_or_iforest_pct":
-                round(((hit["f_statistical"] + hit["m_iforest"]) >= 1).mean() * 100, 1)
-                if len(hit) else np.nan})
-    out["rule_confirmation"] = pd.DataFrame(r)
-
-    for k, tbl in out.items():
-        tbl.to_csv(C.RESULTS / f"eval_{k}.csv")
-    _plot_comparison(out)
-    return out
+def method_zscore(df):
+    std = np.maximum(df["ctx_std"], 0.02 * df["ctx_mean"].abs() + 1e-6)
+    z = (df["kwh"] - df["ctx_mean"]) / std
+    z = z.where(df["ctx_n"] >= C.MIN_CONTEXT_SAMPLES)
+    df["zscore_value"] = z.astype("float32")
+    return z > C.ZSCORE_THRESHOLD
 
 
-def _plot_comparison(out):
-    names = [m.replace("m_", "") for m in MCOLS] + ["final_anomaly"]
-    cnt = out["counts"].set_index("detector").loc[names]
-    fig, ax = plt.subplots(1, 3, figsize=(17, 4.5))
-    cnt["flagged_hours"].plot.bar(ax=ax[0], color="black")
-    ax[0].set_title("Hours flagged per method"); ax[0].set_ylabel("hours")
-    styles = ["-", "--", ":", "-."]
-    for i, c in enumerate(out["time_hour"].columns):
-        ax[1].plot(out["time_hour"].index, out["time_hour"][c], color="black",
-                   ls=styles[i % 4], lw=1.2, label=c.replace("m_", ""))
-    ax[1].legend(fontsize=8)
-    ax[1].set_title("When (hour of day) are anomalies flagged?")
-    ax[1].set_xlabel("hour"); ax[1].set_ylabel("share of method's flags")
-    j = out["jaccard"].astype(float)
-    im = ax[2].imshow(j.values, cmap="Greys", vmin=0, vmax=1)
-    ax[2].set_xticks(range(len(j))); ax[2].set_xticklabels(j.columns, rotation=30)
-    ax[2].set_yticks(range(len(j))); ax[2].set_yticklabels(j.index)
-    for (a, b), val in np.ndenumerate(j.values):
-        ax[2].text(b, a, f"{val:.2f}", ha="center", va="center",
-                   color="white" if val > 0.5 else "black")
-    ax[2].set_title("Agreement between methods (Jaccard)")
-    fig.colorbar(im, ax=ax[2], fraction=0.046)
-    fig.tight_layout(); fig.savefig(C.FIGURES / "method_comparison.png", dpi=140); plt.close(fig)
-
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-    for i, c in enumerate(out["time_weekday"].columns):
-        ax[0].plot(out["time_weekday"].index, out["time_weekday"][c], color="black", ls=styles[i % 4])
-        ax[1].plot(out["time_month"].index, out["time_month"][c], color="black", ls=styles[i % 4])
-    ax[0].set_title("By weekday (0 = Monday)"); ax[1].set_title("By month")
-    fig.tight_layout(); fig.savefig(C.FIGURES / "time_distribution.png", dpi=140); plt.close(fig)
+def method_iqr(df):
+    fence = df["ctx2_q3"] + C.IQR_K * (df["ctx2_q3"] - df["ctx2_q1"])
+    return (df["kwh"] > fence) & (df["ctx2_n"] >= C.MIN_CONTEXT_SAMPLES)
 
 
-# ---------------------------------------------------------------- events
-def build_events(df: pd.DataFrame) -> pd.DataFrame:
-    d = df[["building_id", "timestamp", "kwh", "expected_kwh", "airTemperature",
-            "final_anomaly", "n_families", "n_methods"] + MCOLS + TYPE_COLS].copy()
-    d["excess"] = (d["kwh"] - d["expected_kwh"]).clip(lower=0)
-    flag = d["final_anomaly"] == 1
-    run = (flag != flag.groupby(d["building_id"]).shift()).cumsum()
-    ev = d[flag].copy()
-    ev["event_id"] = run[flag]
-    agg = ev.groupby("event_id").agg(
-        building_id=("building_id", "first"), start=("timestamp", "min"),
-        end=("timestamp", "max"), duration_h=("timestamp", "size"),
-        actual_kwh=("kwh", "sum"), expected_kwh=("expected_kwh", "sum"),
-        total_excess_kwh=("excess", "sum"), peak_excess_kwh=("excess", "max"),
-        mean_temp_c=("airTemperature", "mean"), max_families=("n_families", "max"),
-        **{t: (t, "sum") for t in TYPE_COLS}, **{m: (m, "sum") for m in MCOLS})
-    agg["primary_type"] = agg[TYPE_COLS].idxmax(axis=1).where(agg[TYPE_COLS].sum(axis=1) > 0,
-                                                            "unclassified")
-    agg["methods"] = agg[MCOLS].gt(0).apply(
-        lambda r: "+".join(m.replace("m_", "") for m in MCOLS if r[m]), axis=1)
-    agg["weekday"] = agg["start"].dt.day_name()
-    agg["start_hour"] = agg["start"].dt.hour
-    agg["possible_reason"] = agg.apply(_reason, axis=1)
-    return agg.reset_index(drop=True).sort_values("total_excess_kwh", ascending=False)
+def method_iforest(df):
+    flags = pd.Series(False, index=df.index)
+    score = pd.Series(np.nan, index=df.index, dtype="float64")
+    prev24 = df.groupby("building_id")["kwh"].transform(
+        lambda s: s.rolling(24, min_periods=12).mean())
+    feats = pd.DataFrame({
+        "kwh": df["kwh"],
+        "ratio_ctx": df["kwh"] / (df["ctx_median"] + 1e-6),
+        "hour_sin": np.sin(2 * np.pi * df["hour"] / 24),
+        "hour_cos": np.cos(2 * np.pi * df["hour"] / 24),
+        "is_off": df["is_off"],
+        "temp": df["airTemperature"],
+        "delta_1h": df.get("delta_1h", pd.Series(0.0, index=df.index)),
+        "ratio_24h": df["kwh"] / (prev24 + 1e-6),
+    })
+    for _, idx in df.groupby("building_id").groups.items():
+        X = feats.loc[idx]
+        ok = X.notna().all(axis=1) & df.loc[idx, "kwh"].notna()
+        if ok.sum() < 500:
+            continue
+        model = IsolationForest(n_estimators=C.IFOREST_ESTIMATORS,
+                                contamination=C.IFOREST_CONTAMINATION,
+                                random_state=C.RANDOM_STATE, n_jobs=2)
+        model.fit(X[ok])
+        pred = model.predict(X[ok]) == -1
+        high_side = df.loc[X.index[ok], "kwh"] > df.loc[X.index[ok], "ctx_median"]
+        flags.loc[X.index[ok]] = pred & high_side.to_numpy()
+        score.loc[X.index[ok]] = -model.score_samples(X[ok])
+    df["iforest_score"] = score.astype("float32")
+    return flags
 
 
-def _reason(r) -> str:
-    t, temp = r["primary_type"], r["mean_temp_c"]
-    weather = ("hot weather - cooling plant / chiller running harder or left at occupied setpoint"
-               if temp >= 24 else
-               "cold weather - electric heating / heat pumps or fans over-running"
-               if temp <= 5 else "mild weather - the load is not weather driven")
-    return {
-        "night_high": "Load stays high at night: HVAC, lighting or lab/IT equipment probably not "
-                      "scheduled off (check night set-back schedule) or an unplanned night event.",
-        "weekend_high": "Weekend / break-day load at working-day level: the weekday HVAC and "
-                        "lighting schedule also ran, or there was a class, exam or event.",
-        "sudden_increase": "Abrupt step in load: equipment (chiller, boiler, pumps, fans) switched "
-                           "on, schedule started earlier than usual, or a control override.",
-        "weather_deviation": f"Higher than expected for similar weather; {weather}.",
-        "sustained_high": f"Elevated load for {r['duration_h']} h: equipment left running or a manual "
-                          "override; " + weather + ".",
-    }.get(t, f"Several methods agree on unusually high load; {weather}.")
+def method_residual(df):
+    resid = df["kwh"] - df["expected_kwh"]
+    g = resid.groupby(df["building_id"])
+    q1, q3 = g.transform(lambda s: s.quantile(.25)), g.transform(lambda s: s.quantile(.75))
+    return (resid > q3 + C.RESIDUAL_IQR_K * (q3 - q1)) & (df["expected_kwh"] > 0)
 
 
-def select_cases(events: pd.DataFrame, n: int = C.N_CASES,
-                 n_borderline: int = C.N_BORDERLINE_CASES) -> pd.DataFrame:
-    """n - n_borderline cases = biggest events per anomaly type (different
-    buildings); n_borderline cases = weakest events (only 2 families agree and
-    small excess), so the manual review also tests for FALSE alarms."""
-    ev = events[events["duration_h"] >= 1]
-    n_top = max(n - n_borderline, 15)
-    per_type = max(3, n_top // 5)
-    used = {}                                    # max 2 cases per building
-
-    def take(sub, k):
-        rows = []
-        for idx, r in sub.iterrows():
-            if used.get(r["building_id"], 0) < 2 and len(rows) < k:
-                used[r["building_id"]] = used.get(r["building_id"], 0) + 1
-                rows.append(idx)
-        return sub.loc[rows]
-
-    picks = [take(ev[ev["primary_type"] == t].drop_duplicates("building_id"), per_type)
-             for t in TYPE_COLS + ["unclassified"]]
-    top = pd.concat(picks)
-    if len(top) < n_top:
-        rest = ev.drop(top.index, errors="ignore")
-        top = pd.concat([top, take(rest, n_top - len(top))])
-    top = top.head(n_top).assign(case_group="largest excess")
-
-    weak = ev.drop(top.index, errors="ignore")
-    weak = weak[weak["max_families"] == 2]
-    weak = weak[weak["total_excess_kwh"] <= weak["total_excess_kwh"].quantile(0.25)]
-    weak = weak.sample(min(n_borderline, len(weak)), random_state=C.RANDOM_STATE) \
-        if len(weak) else weak
-    weak = weak.assign(case_group="borderline")
-
-    cases = pd.concat([top, weak]).reset_index(drop=True)
-    cases.insert(0, "case_id", [f"case_{i + 1:02d}" for i in range(len(cases))])
-    cases["verdict"] = ""            # <- true anomaly / plausible / false alarm
-    cases["reviewer_notes"] = ""     # <- the student writes the manual explanation here
-    return cases
-
-
-def plot_cases(df: pd.DataFrame, cases: pd.DataFrame, pad_days: int = 4):
-    for old in C.CASES.glob("case_*.png"):       # remove plots of earlier runs
-        old.unlink()
-    by_b = {b: g.set_index("timestamp") for b, g in df.groupby("building_id")}
-    for _, c in cases.iterrows():
-        g = by_b[c["building_id"]]
-        lo = c["start"] - pd.Timedelta(days=pad_days)
-        hi = c["end"] + pd.Timedelta(days=pad_days)
-        w = g.loc[lo:hi]
-        fig, ax = plt.subplots(figsize=(11, 3.6))
-        ax.plot(w.index, w["kwh"], color="black", lw=1.2, label="actual")
-        ax.plot(w.index, w["expected_kwh"], color="#777777", lw=1.0, ls="--", label="expected")
-        a = w[w["final_anomaly"] == 1]
-        ax.scatter(a.index, a["kwh"], color="black", s=16, zorder=3, label="final anomaly")
-        ax.axvspan(c["start"], c["end"] + pd.Timedelta(hours=1), color="#000000", alpha=.10)
-        ax.set_title(f"{c['case_id']} | {c['building_id']} | {c['primary_type']} | "
-                     f"{c['start']:%Y-%m-%d %H:%M} ({c['duration_h']} h, "
-                     f"+{c['total_excess_kwh']:.0f} kWh)", fontsize=9)
-        ax.set_ylabel("kWh / hour"); ax.legend(loc="upper left", fontsize=8)
-        fig.tight_layout()
-        fig.savefig(C.CASES / f"{c['case_id']}_{c['building_id']}.png", dpi=110)
-        plt.close(fig)
+def apply_methods(df: pd.DataFrame) -> pd.DataFrame:
+    valid = df["kwh"].notna()
+    fns = {"zscore": method_zscore, "iqr": method_iqr,
+           "iforest": method_iforest, "residual": method_residual}
+    for name, fn in fns.items():
+        df[f"m_{name}"] = (fn(df).fillna(False) & valid).astype("int8")
+    mcols = [f"m_{m}" for m in METHODS]
+    df["n_methods"] = df[mcols].sum(axis=1).astype("int8")
+    df["f_statistical"] = (df["m_zscore"] | df["m_iqr"]).astype("int8")
+    df["n_families"] = (df["f_statistical"] + df["m_iforest"] + df["m_residual"]).astype("int8")
+    df["final_anomaly"] = (df["n_families"] >= C.MIN_FAMILIES_FOR_FINAL).astype("int8")
+    df["final_low"] = (df["n_families"] >= C.MIN_FAMILIES_LOW).astype("int8")
+    df["final_high"] = (df["n_methods"] >= 2).astype("int8")
+    return df
