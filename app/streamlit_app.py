@@ -38,13 +38,19 @@ TYPE_TEXT = {
 SYMBOL_METHOD = dict(zip(METHODS, ["circle-open", "square-open", "x", "diamond-open"]))
 SYMBOL_TYPE = dict(zip(TYPES, ["circle-open", "square-open", "triangle-up-open", "x", "diamond-open"]))
 DASH_METHOD = dict(zip(METHODS, ["solid", "dash", "dot", "dashdot"]))
+# one fixed colour per method / anomaly type, used in every chart
+MCOL = {"zscore": "#1f77b4", "iqr": "#ff7f0e", "iforest": "#2ca02c", "residual": "#9467bd",
+        "final": "#d62728"}
+TCOL = dict(zip(TYPES, ["#3b4cc0", "#e377c2", "#d62728", "#17becf", "#bcbd22"]))
+SAVE_C, LOW_C, HIGH_C = "#2a9d8f", "#e9c46a", "#e76f51"
+HEAT = "YlOrRd"
 
 # ----------------------------------------------------------------- styling
 BW = go.layout.Template()
 BW.layout = go.Layout(
     paper_bgcolor="white", plot_bgcolor="white",
     font=dict(color="black", family="Helvetica, Arial, sans-serif", size=13),
-    colorway=["#000000", "#666666", "#999999", "#bbbbbb", "#dddddd"],
+    colorway=["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#d62728"],
     xaxis=dict(showgrid=False, linecolor="black", ticks="outside", zeroline=False),
     yaxis=dict(gridcolor="#e5e5e5", linecolor="black", ticks="outside", zeroline=False),
     margin=dict(t=50, b=30, l=50, r=20), hovermode="x unified",
@@ -134,14 +140,14 @@ with tabs[0]:
     if len(fin):
         heat = (fin.pivot_table(index="dow", columns="hour", values="kwh", aggfunc="size", fill_value=0)
                 .reindex(index=range(7), columns=range(24), fill_value=0))
-        fig = go.Figure(go.Heatmap(z=heat.values, x=list(range(24)), y=DAYS, colorscale=GREYS,
+        fig = go.Figure(go.Heatmap(z=heat.values, x=list(range(24)), y=DAYS, colorscale=HEAT,
                                    colorbar=dict(title="hours")))
         fig.update_yaxes(autorange="reversed")
         fig.update_layout(title="When do anomalies occur?", xaxis_title="hour of day")
         with a:
             show(fig)
     tcount = pd.DataFrame({"type": TYPES, "hours": [int(scope[t].sum()) for t in TYPES]})
-    fig = go.Figure(go.Bar(x=tcount["hours"], y=tcount["type"], orientation="h", marker_color="black"))
+    fig = go.Figure(go.Bar(x=tcount["hours"], y=tcount["type"], orientation="h", marker_color=[TCOL[t] for t in tcount["type"]]))
     fig.update_yaxes(autorange="reversed")
     fig.update_layout(title="Anomaly hours per rule type")
     with b:
@@ -159,6 +165,9 @@ with tabs[1]:
     mode = st.radio("Show anomalies by",
                     ["Each method in its own panel", "Final decision", "Detection method (overlay)",
                      "Anomaly type"], horizontal=True)
+    st.caption("Panels / overlay = WHICH DETECTION METHOD flagged the hour (Task 3). "
+               "Anomaly type = WHAT KIND of abnormal behaviour it is, from the Task 2 rules. "
+               "Final decision = hours flagged by at least 2 method families.")
     g = scope[scope["building_id"] == bsel].sort_values("timestamp")
     fig = go.Figure()
     fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["kwh"], mode="lines", name="actual",
@@ -178,28 +187,28 @@ with tabs[1]:
                                        line=dict(color="#999999", width=1)), row=i, col=1)
             a_ = g[flag == 1]
             fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", showlegend=False,
-                                       marker=dict(color="black", size=5)), row=i, col=1)
+                                       marker=dict(color=MCOL[k], size=5)), row=i, col=1)
         fig_h = 150 * len(panels) + 80
     elif mode == "Final decision":
         a_ = g[g["final_anomaly"] == 1]
         fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name="final anomaly",
-                                   marker=dict(color="black", size=5)))
+                                   marker=dict(color=MCOL["final"], size=6)))
     elif mode == "Detection method (overlay)":
         for m in METHODS:
             a_ = g[g[f"m_{m}"] == 1]
             fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name=m,
-                                       marker=dict(color="black", size=7, symbol=SYMBOL_METHOD[m])))
+                                       marker=dict(color=MCOL[m], size=7, symbol=SYMBOL_METHOD[m].replace("-open", ""))))
     else:
         for t in TYPES:
             a_ = g[g[t] == 1]
             fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name=t,
-                                       marker=dict(color="black", size=7, symbol=SYMBOL_TYPE[t])))
+                                       marker=dict(color=TCOL[t], size=7, symbol=SYMBOL_TYPE[t].replace("-open", ""))))
     fig.update_layout(title=f"{bsel}: normal and abnormal periods")
     if mode != "Each method in its own panel":
         fig.update_layout(yaxis_title="kWh per hour")
     show(fig, fig_h)
     daily = g.assign(date=g["timestamp"].dt.date).groupby("date")["saving_kwh"].sum().reset_index()
-    fig = go.Figure(go.Bar(x=daily["date"], y=daily["saving_kwh"], marker_color="black"))
+    fig = go.Figure(go.Bar(x=daily["date"], y=daily["saving_kwh"], marker_color=SAVE_C))
     fig.update_layout(title="Estimated avoidable consumption per day (kWh)")
     show(fig, 260)
 
@@ -217,11 +226,13 @@ with tabs[2]:
         "pct_of_hours": round(scope["final_anomaly"].sum() / nvalid * 100, 2),
         "buildings_flagged": int(scope.loc[scope["final_anomaly"] == 1, "building_id"].nunique())}])
     st.subheader("Detection methods compared")
+    st.caption("All charts on this tab compare the four methods side by side "
+               "(each has its own colour); 'final' is the combined vote used for the savings.")
     st.dataframe(summ, width="stretch", hide_index=True)
     names = METHODS + ["final"]
     cnt = [int(scope[f"m_{m}"].sum()) for m in METHODS] + [int(scope["final_anomaly"].sum())]
     a, b = st.columns(2)
-    fig = go.Figure(go.Bar(x=names, y=cnt, marker_color=["black"] * 4 + ["#888888"]))
+    fig = go.Figure(go.Bar(x=names, y=cnt, marker_color=[MCOL[n] for n in names]))
     fig.update_layout(title="Hours flagged", hovermode="closest")
     with a:
         show(fig, 330)
@@ -230,7 +241,7 @@ with tabs[2]:
         for m2 in METHODS:
             A, B = scope[f"m_{m1}"] == 1, scope[f"m_{m2}"] == 1
             jac.loc[m1, m2] = (A & B).sum() / max((A | B).sum(), 1)
-    fig = go.Figure(go.Heatmap(z=jac.values.round(2), x=METHODS, y=METHODS, colorscale=GREYS,
+    fig = go.Figure(go.Heatmap(z=jac.values.round(2), x=METHODS, y=METHODS, colorscale=HEAT,
                                zmin=0, zmax=1, text=jac.values.round(2), texttemplate="%{text}"))
     fig.update_yaxes(autorange="reversed")
     fig.update_layout(title="Agreement between methods (Jaccard)", hovermode="closest")
@@ -241,7 +252,7 @@ with tabs[2]:
     fig = go.Figure()
     for m in METHODS:
         fig.add_trace(go.Scatter(x=hh.index, y=hh[m] / max(hh[m].sum(), 1), mode="lines", name=m,
-                                 line=dict(color="black", width=1.5, dash=DASH_METHOD[m])))
+                                 line=dict(color=MCOL[m], width=2, dash=DASH_METHOD[m])))
     fig.update_layout(title="When in the day does each method flag? (share of its flags)",
                       xaxis_title="hour of day")
     show(fig, 320)
@@ -253,7 +264,7 @@ with tabs[2]:
         for m in METHODS:
             f_.add_trace(go.Scatter(x=(DAYS if key == "dow" else list(tt.index)), y=tt[m] / max(tt[m].sum(), 1),
                                     mode="lines", name=m,
-                                    line=dict(color="black", width=1.5, dash=DASH_METHOD[m])))
+                                    line=dict(color=MCOL[m], width=2, dash=DASH_METHOD[m])))
         f_.update_layout(title=f"Share of each method's flags by {lab}")
         with col_:
             show(f_, 300)
@@ -282,17 +293,17 @@ with tabs[3]:
     c[3].metric("Avoidable share", f"{s_c / max(sc['kwh'].sum(), 1) * 100:.2f} %")
     mon = sc.groupby("month")[["saving_low_kwh", "saving_kwh", "saving_high_kwh", "kwh"]].sum().reset_index()
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=mon["month"], y=mon["saving_kwh"], name="central", marker_color="black"))
+    fig.add_trace(go.Bar(x=mon["month"], y=mon["saving_kwh"], name="central", marker_color=SAVE_C))
     fig.add_trace(go.Scatter(x=mon["month"], y=mon["saving_low_kwh"], name="low", mode="lines+markers",
-                             line=dict(color="#888888", dash="dot")))
+                             line=dict(color=LOW_C, dash="dot")))
     fig.add_trace(go.Scatter(x=mon["month"], y=mon["saving_high_kwh"], name="high", mode="lines+markers",
-                             line=dict(color="#888888", dash="dash")))
+                             line=dict(color=HIGH_C, dash="dash")))
     fig.update_layout(title="Monthly potential saving (kWh)")
     show(fig, 340)
     top = bld.head(15).iloc[::-1]
     fig = go.Figure(go.Bar(
-        x=top["saving_kwh"], y=top["building_id"], orientation="h", marker_color="black",
-        error_x=dict(type="data", symmetric=False, color="#888888",
+        x=top["saving_kwh"], y=top["building_id"], orientation="h", marker_color=SAVE_C,
+        error_x=dict(type="data", symmetric=False, color=HIGH_C,
                      array=(top["saving_high"] - top["saving_kwh"]).clip(lower=0),
                      arrayminus=(top["saving_kwh"] - top["saving_low"]).clip(lower=0))))
     fig.update_layout(title="15 buildings with the greatest saving potential (bar = central, whisker = low-high)",
@@ -301,7 +312,7 @@ with tabs[3]:
     site_sv = (scope.groupby("site_id")[["saving_kwh", "kwh"]].sum().reset_index()
                .assign(avoidable_pct=lambda x: x.saving_kwh / x.kwh * 100)
                .sort_values("saving_kwh", ascending=False))
-    fig = go.Figure(go.Bar(x=site_sv["site_id"], y=site_sv["saving_kwh"], marker_color="black"))
+    fig = go.Figure(go.Bar(x=site_sv["site_id"], y=site_sv["saving_kwh"], marker_color=SAVE_C))
     fig.update_layout(title="Potential saving by site (kWh)", hovermode="closest")
     show(fig, 300)
 
