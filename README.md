@@ -8,7 +8,6 @@ high, and estimates how much energy could have been avoided.
 
 ```bash
 pip install -r requirements.txt
-python scripts/download_data.py        # BDG2 files (handles Git LFS), ~195 MB
 python run_pipeline.py                 # 60 most complete education buildings, ~3-4 min
 streamlit run app/streamlit_app.py     # black-and-white dashboard
 pytest -q                              # unit tests on synthetic data

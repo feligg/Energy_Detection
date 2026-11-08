@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -155,19 +156,35 @@ with tabs[0]:
 with tabs[1]:
     order = bld["building_id"].tolist()
     bsel = st.selectbox("Building (sorted by saving potential)", order)
-    mode = st.radio("Show anomalies by", ["Final decision", "Detection method", "Anomaly type"],
-                    horizontal=True)
+    mode = st.radio("Show anomalies by",
+                    ["Each method in its own panel", "Final decision", "Detection method (overlay)",
+                     "Anomaly type"], horizontal=True)
     g = scope[scope["building_id"] == bsel].sort_values("timestamp")
     fig = go.Figure()
     fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["kwh"], mode="lines", name="actual",
                                line=dict(color="black", width=1)))
     fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["expected_kwh"], mode="lines",
                                name="expected normal", line=dict(color="#888888", width=1, dash="dot")))
-    if mode == "Final decision":
+    fig_h = 460
+    if mode == "Each method in its own panel":
+        panels = [("zscore", "Z-score"), ("iqr", "IQR"), ("iforest", "Isolation Forest"),
+                  ("residual", "Residual (actual vs expected / Student 1)"), ("final", "Final decision")]
+        fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                            subplot_titles=[f"{t}: {int((g['final_anomaly'] if k == 'final' else g[f'm_{k}']).sum())} h"
+                                            for k, t in panels])
+        for i, (k, t) in enumerate(panels, start=1):
+            flag = g["final_anomaly"] if k == "final" else g[f"m_{k}"]
+            fig.add_trace(go.Scattergl(x=g["timestamp"], y=g["kwh"], mode="lines", showlegend=False,
+                                       line=dict(color="#999999", width=1)), row=i, col=1)
+            a_ = g[flag == 1]
+            fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", showlegend=False,
+                                       marker=dict(color="black", size=5)), row=i, col=1)
+        fig_h = 150 * len(panels) + 80
+    elif mode == "Final decision":
         a_ = g[g["final_anomaly"] == 1]
         fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name="final anomaly",
                                    marker=dict(color="black", size=5)))
-    elif mode == "Detection method":
+    elif mode == "Detection method (overlay)":
         for m in METHODS:
             a_ = g[g[f"m_{m}"] == 1]
             fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name=m,
@@ -177,8 +194,10 @@ with tabs[1]:
             a_ = g[g[t] == 1]
             fig.add_trace(go.Scattergl(x=a_["timestamp"], y=a_["kwh"], mode="markers", name=t,
                                        marker=dict(color="black", size=7, symbol=SYMBOL_TYPE[t])))
-    fig.update_layout(yaxis_title="kWh per hour", title=f"{bsel}: normal and abnormal periods")
-    show(fig, 460)
+    fig.update_layout(title=f"{bsel}: normal and abnormal periods")
+    if mode != "Each method in its own panel":
+        fig.update_layout(yaxis_title="kWh per hour")
+    show(fig, fig_h)
     daily = g.assign(date=g["timestamp"].dt.date).groupby("date")["saving_kwh"].sum().reset_index()
     fig = go.Figure(go.Bar(x=daily["date"], y=daily["saving_kwh"], marker_color="black"))
     fig.update_layout(title="Estimated avoidable consumption per day (kWh)")
@@ -186,6 +205,19 @@ with tabs[1]:
 
 # -------------------------------------------------------------- 3 methods
 with tabs[2]:
+    nvalid = max(len(scope), 1)
+    LABEL = {"zscore": "1. Z-score", "iqr": "2. IQR", "iforest": "3. Isolation Forest",
+             "residual": "4. Residual vs expected (Student 1 / baseline)"}
+    summ = pd.DataFrame([{
+        "method": LABEL[m], "flagged_hours": int(scope[f"m_{m}"].sum()),
+        "pct_of_hours": round(scope[f"m_{m}"].sum() / nvalid * 100, 2),
+        "buildings_flagged": int(scope.loc[scope[f"m_{m}"] == 1, "building_id"].nunique()),
+    } for m in METHODS] + [{
+        "method": "Final (>= 2 families)", "flagged_hours": int(scope["final_anomaly"].sum()),
+        "pct_of_hours": round(scope["final_anomaly"].sum() / nvalid * 100, 2),
+        "buildings_flagged": int(scope.loc[scope["final_anomaly"] == 1, "building_id"].nunique())}])
+    st.subheader("Detection methods compared")
+    st.dataframe(summ, width="stretch", hide_index=True)
     names = METHODS + ["final"]
     cnt = [int(scope[f"m_{m}"].sum()) for m in METHODS] + [int(scope["final_anomaly"].sum())]
     a, b = st.columns(2)
@@ -213,6 +245,18 @@ with tabs[2]:
     fig.update_layout(title="When in the day does each method flag? (share of its flags)",
                       xaxis_title="hour of day")
     show(fig, 320)
+    w1, w2 = st.columns(2)
+    for col_, key, lab, order_ in [(w1, "dow", "weekday", range(7)), (w2, "month", "month", range(1, 13))]:
+        tt = pd.concat([scope[scope[f"m_{m}"] == 1].groupby(key).size().rename(m) for m in METHODS],
+                       axis=1).reindex(list(order_)).fillna(0)
+        f_ = go.Figure()
+        for m in METHODS:
+            f_.add_trace(go.Scatter(x=(DAYS if key == "dow" else list(tt.index)), y=tt[m] / max(tt[m].sum(), 1),
+                                    mode="lines", name=m,
+                                    line=dict(color="black", width=1.5, dash=DASH_METHOD[m])))
+        f_.update_layout(title=f"Share of each method's flags by {lab}")
+        with col_:
+            show(f_, 300)
     per_b = scope.groupby("building_id")[[f"m_{m}" for m in METHODS] + ["final_anomaly"]].sum()
     per_b.columns = METHODS + ["final"]
     st.subheader("Flagged hours per building")
@@ -281,7 +325,20 @@ with tabs[5]:
         cols = [c_ for c_ in ["case_id", "case_group", "building_id", "start", "duration_h",
                               "total_excess_kwh", "primary_type", "methods", "verdict",
                               "reviewer_notes"] if c_ in cs.columns]
-        st.dataframe(cs[cols], width="stretch", hide_index=True)
+        st.caption("Task 4: inspect each case (plot below), then write your verdict and explanation. "
+                   "Press Save to store it in representative_cases.csv.")
+        edited = st.data_editor(cs[cols], width="stretch", hide_index=True,
+                                disabled=[c_ for c_ in cols if c_ not in ("verdict", "reviewer_notes")],
+                                column_config={"verdict": st.column_config.SelectboxColumn(
+                                    "verdict", options=["", "true anomaly", "plausible", "false alarm"])})
+        if st.button("Save verdicts and notes"):
+            full = pd.read_csv(f).fillna("")
+            for c_ in ("verdict", "reviewer_notes"):
+                full[c_] = edited[c_].to_numpy()
+            full.to_csv(f, index=False)
+            st.success("Saved.")
+        done = int((edited["verdict"] != "").sum()) if "verdict" in edited else 0
+        st.caption(f"{done} of {len(edited)} cases reviewed (at least 20 are required).")
         cid = st.selectbox("Case plot", cs["case_id"].tolist())
         img = list(CASES.glob(f"{cid}_*.png"))
         if img:

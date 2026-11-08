@@ -9,6 +9,8 @@ import argparse
 import json
 import time
 
+import pandas as pd
+
 from src import config as C
 from src import anomaly_rules, baseline, data_prep, detectors, evaluation, savings, validation
 
@@ -47,7 +49,15 @@ def main():
     events = evaluation.build_events(df)
     events.to_csv(C.RESULTS / "anomaly_events.csv", index=False)
     cases = evaluation.select_cases(events)
-    cases.to_csv(C.RESULTS / "representative_cases.csv", index=False)
+    case_file = C.RESULTS / "representative_cases.csv"
+    if case_file.exists():                      # keep manual verdicts / notes from earlier runs
+        old = pd.read_csv(case_file, parse_dates=["start"]).fillna("")
+        old = old[(old["verdict"] != "") | (old["reviewer_notes"] != "")]
+        key = ["building_id", "start"]
+        cases = cases.drop(columns=["verdict", "reviewer_notes"]).merge(
+            old[key + ["verdict", "reviewer_notes"]], on=key, how="left")
+        cases[["verdict", "reviewer_notes"]] = cases[["verdict", "reviewer_notes"]].fillna("")
+    cases.to_csv(case_file, index=False)
     evaluation.plot_cases(df, cases)
 
     step("Task 5: energy-saving potential (low / central / high)")
